@@ -9,6 +9,8 @@ from flask_cors import CORS
 import sys
 import warnings
 import datetime
+import math
+import time
 warnings.filterwarnings('ignore')
 
 # Add project root directory to path
@@ -28,6 +30,15 @@ CORS(app)
 tokenizer = None
 model = None
 predictor = None
+current_model_key = None
+
+TIMEFRAME_INTERVALS = {
+    '5min': pd.Timedelta(minutes=5),
+    '1h': pd.Timedelta(hours=1),
+    '2h': pd.Timedelta(hours=2),
+    '4h': pd.Timedelta(hours=4),
+    '1D': pd.Timedelta(days=1),
+}
 
 # Available model configurations
 AVAILABLE_MODELS = {
@@ -121,6 +132,62 @@ def load_data_file(file_path):
         
     except Exception as e:
         return None, f"Failed to load file: {str(e)}"
+
+def load_inline_candles(candles):
+    """Validate JSON OHLCV candles and return a timestamped DataFrame."""
+    if not isinstance(candles, list) or not candles:
+        return None, "candles must be a non-empty array"
+
+    rows = []
+    for index, candle in enumerate(candles):
+        if not isinstance(candle, dict):
+            return None, f"candles[{index}] must be an object"
+
+        raw_timestamp = candle.get('timestamp', candle.get('timestamps'))
+        try:
+            if isinstance(raw_timestamp, bool):
+                raise ValueError()
+            if isinstance(raw_timestamp, (int, float)):
+                if not math.isfinite(raw_timestamp):
+                    raise ValueError()
+                timestamp = pd.to_datetime(raw_timestamp, unit='ms', utc=True)
+            elif isinstance(raw_timestamp, str):
+                timestamp = pd.Timestamp(raw_timestamp)
+                if timestamp.tzinfo is None:
+                    return None, f"candles[{index}].timestamp needs a timezone offset"
+            else:
+                raise ValueError()
+        except (ValueError, TypeError, OverflowError):
+            return None, f"candles[{index}].timestamp must be ISO 8601 with timezone or Unix milliseconds"
+
+        values = {}
+        for field in ('open', 'high', 'low', 'close', 'volume'):
+            raw_value = candle.get(field, 0 if field == 'volume' else None)
+            try:
+                if isinstance(raw_value, bool):
+                    raise ValueError()
+                value = float(raw_value)
+                if not math.isfinite(value):
+                    raise ValueError()
+            except (ValueError, TypeError):
+                return None, f"candles[{index}].{field} must be a finite number"
+            values[field] = value
+
+        if min(values[field] for field in ('open', 'high', 'low', 'close')) <= 0:
+            return None, f"candles[{index}] prices must be positive"
+        if values['volume'] < 0:
+            return None, f"candles[{index}].volume must be non-negative"
+        if values['high'] < max(values['open'], values['close'], values['low']) or \
+                values['low'] > min(values['open'], values['close'], values['high']):
+            return None, f"candles[{index}] has inconsistent OHLC prices"
+
+        rows.append({'timestamps': timestamp, **values})
+
+    df = pd.DataFrame(rows)
+    df['timestamps'] = pd.to_datetime(df['timestamps'], utc=True)
+    if len(df) > 1 and not df['timestamps'].diff().iloc[1:].gt(pd.Timedelta(0)).all():
+        return None, "candles timestamps must be strictly increasing"
+    return df, None
 
 def save_prediction_results(file_path, prediction_type, prediction_results, actual_data, input_data, prediction_params):
     """Save prediction results to file"""
@@ -226,10 +293,10 @@ def create_prediction_chart(df, pred_df, lookback, pred_len, actual_df=None, his
     # Add historical data (candlestick chart)
     fig.add_trace(go.Candlestick(
         x=historical_df['timestamps'] if 'timestamps' in historical_df.columns else historical_df.index,
-        open=historical_df['open'],
-        high=historical_df['high'],
-        low=historical_df['low'],
-        close=historical_df['close'],
+        open=historical_df['open'].tolist(),
+        high=historical_df['high'].tolist(),
+        low=historical_df['low'].tolist(),
+        close=historical_df['close'].tolist(),
         name='Historical Data (400 data points)',
         increasing_line_color='#26A69A',
         decreasing_line_color='#EF5350'
@@ -254,10 +321,10 @@ def create_prediction_chart(df, pred_df, lookback, pred_len, actual_df=None, his
         
         fig.add_trace(go.Candlestick(
             x=pred_timestamps,
-            open=pred_df['open'],
-            high=pred_df['high'],
-            low=pred_df['low'],
-            close=pred_df['close'],
+            open=pred_df['open'].tolist(),
+            high=pred_df['high'].tolist(),
+            low=pred_df['low'].tolist(),
+            close=pred_df['close'].tolist(),
             name='Prediction Data (120 data points)',
             increasing_line_color='#66BB6A',
             decreasing_line_color='#FF7043'
@@ -287,18 +354,21 @@ def create_prediction_chart(df, pred_df, lookback, pred_len, actual_df=None, his
         
         fig.add_trace(go.Candlestick(
             x=actual_timestamps,
-            open=actual_df['open'],
-            high=actual_df['high'],
-            low=actual_df['low'],
-            close=actual_df['close'],
+            open=actual_df['open'].tolist(),
+            high=actual_df['high'].tolist(),
+            low=actual_df['low'].tolist(),
+            close=actual_df['close'].tolist(),
             name='Actual Data (120 data points)',
             increasing_line_color='#FF9800',
             decreasing_line_color='#F44336'
         ))
     
     # Update layout
+    chart_title = f'Kronos: {len(historical_df)} historical candles + {len(pred_df)} predicted candles'
+    if actual_df is not None and len(actual_df) > 0:
+        chart_title += f' vs {len(actual_df)} actual candles'
     fig.update_layout(
-        title='Kronos Financial Prediction Results - 400 Historical Points + 120 Prediction Points vs 120 Actual Points',
+        title=chart_title,
         xaxis_title='Time',
         yaxis_title='Price',
         template='plotly_white',
@@ -405,26 +475,46 @@ def load_data():
 def predict():
     """Perform prediction"""
     try:
-        data = request.get_json()
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({'error': 'Request body must be a JSON object'}), 400
         file_path = data.get('file_path')
-        lookback = int(data.get('lookback', 400))
-        pred_len = int(data.get('pred_len', 120))
+        has_inline_candles = 'candles' in data
+        try:
+            lookback = int(data.get('lookback', 400))
+            pred_len = int(data.get('pred_len', 120))
+            temperature = float(data.get('temperature', 1.0))
+            top_p = float(data.get('top_p', 0.9))
+            sample_count = int(data.get('sample_count', 1))
+        except (ValueError, TypeError, OverflowError):
+            return jsonify({'error': 'Invalid numeric prediction parameter'}), 400
+        mode = data.get('mode', 'future' if has_inline_candles else 'historical')
+
+        if mode not in ('historical', 'future'):
+            return jsonify({'error': 'Unsupported prediction mode'}), 400
+        if lookback < 2 or pred_len < 1:
+            return jsonify({'error': 'Lookback must be at least 2 and prediction length at least 1'}), 400
+        if has_inline_candles and data.get('timeframe') not in TIMEFRAME_INTERVALS:
+            return jsonify({'error': 'timeframe must be one of 5min, 1h, 2h, 4h, 1D'}), 400
         
-        # Get prediction quality parameters
-        temperature = float(data.get('temperature', 1.0))
-        top_p = float(data.get('top_p', 0.9))
-        sample_count = int(data.get('sample_count', 1))
+        if not math.isfinite(temperature) or temperature <= 0 or not math.isfinite(top_p) or not 0 < top_p <= 1 or sample_count < 1:
+            return jsonify({'error': 'temperature must be positive, top_p within (0, 1], and sample_count at least 1'}), 400
         
-        if not file_path:
-            return jsonify({'error': 'File path cannot be empty'}), 400
+        if bool(file_path) == has_inline_candles:
+            return jsonify({'error': 'Provide either file_path or candles'}), 400
         
         # Load data
-        df, error = load_data_file(file_path)
+        if has_inline_candles:
+            df, error = load_inline_candles(data['candles'])
+        else:
+            df, error = load_data_file(file_path)
         if error:
             return jsonify({'error': error}), 400
         
         if len(df) < lookback:
             return jsonify({'error': f'Insufficient data length, need at least {lookback} rows'}), 400
+        if has_inline_candles and not df['timestamps'].diff().iloc[1:].eq(TIMEFRAME_INTERVALS[data['timeframe']]).all():
+            return jsonify({'error': 'candles timestamps must match the timeframe without gaps'}), 400
         
         # Perform prediction
         if MODEL_AVAILABLE and predictor is not None:
@@ -438,7 +528,20 @@ def predict():
                 # Process time period selection
                 start_date = data.get('start_date')
                 
-                if start_date:
+                if mode == 'future':
+                    start_date = None
+                    x_df = df.iloc[-lookback:][required_cols]
+                    x_timestamp = df.iloc[-lookback:]['timestamps']
+                    time_diff = TIMEFRAME_INTERVALS[data['timeframe']] if has_inline_candles else x_timestamp.iloc[-1] - x_timestamp.iloc[-2]
+                    if time_diff <= pd.Timedelta(0) or not x_timestamp.diff().iloc[1:].eq(time_diff).all():
+                        return jsonify({'error': 'Future prediction requires evenly spaced, ascending timestamps'}), 400
+                    y_timestamp = pd.Series(pd.date_range(
+                        start=x_timestamp.iloc[-1] + time_diff,
+                        periods=pred_len,
+                        freq=time_diff
+                    ), name='timestamps')
+                    prediction_type = f'Kronos future prediction after {x_timestamp.iloc[-1].isoformat()}'
+                elif start_date:
                     # Custom time period - fix logic: use data within selected window
                     start_dt = pd.to_datetime(start_date)
                     
@@ -476,6 +579,7 @@ def predict():
                 if isinstance(y_timestamp, pd.DatetimeIndex):
                     y_timestamp = pd.Series(y_timestamp, name='timestamps')
                 
+                inference_start = time.perf_counter()
                 pred_df = predictor.predict(
                     df=x_df,
                     x_timestamp=x_timestamp,
@@ -485,6 +589,7 @@ def predict():
                     top_p=top_p,
                     sample_count=sample_count
                 )
+                inference_ms = (time.perf_counter() - inference_start) * 1000
                 
             except Exception as e:
                 return jsonify({'error': f'Kronos model prediction failed: {str(e)}'}), 500
@@ -495,7 +600,9 @@ def predict():
         actual_data = []
         actual_df = None
         
-        if start_date:  # Custom time period
+        if mode == 'future':
+            pass
+        elif start_date:  # Custom time period
             # Fix logic: use data within selected window
             # Prediction uses first 400 data points within selected window
             # Actual data should be last 120 data points within selected window
@@ -536,7 +643,9 @@ def predict():
                     })
         
         # Create chart - pass historical data start position
-        if start_date:
+        if mode == 'future':
+            historical_start_idx = len(df) - lookback
+        elif start_date:
             # Custom time period: find starting position of historical data in original df
             start_dt = pd.to_datetime(start_date)
             mask = df['timestamps'] >= start_dt
@@ -545,10 +654,12 @@ def predict():
             # Latest data: start from beginning
             historical_start_idx = 0
         
-        chart_json = create_prediction_chart(df, pred_df, lookback, pred_len, actual_df, historical_start_idx)
+        chart_json = None if has_inline_candles and mode == 'future' else create_prediction_chart(df, pred_df, lookback, pred_len, actual_df, historical_start_idx)
         
         # Prepare prediction result data - fix timestamp calculation logic
-        if 'timestamps' in df.columns:
+        if mode == 'future':
+            future_timestamps = y_timestamp
+        elif 'timestamps' in df.columns:
             if start_date:
                 # Custom time period: use selected window data to calculate timestamps
                 start_dt = pd.to_datetime(start_date)
@@ -579,21 +690,55 @@ def predict():
             future_timestamps = range(len(df), len(df) + pred_len)
         
         prediction_results = []
+        if has_inline_candles and mode == 'future' and len(pred_df) != pred_len:
+            return jsonify({'error': 'Kronos model returned the wrong number of candles'}), 502
         for i, (_, row) in enumerate(pred_df.iterrows()):
+            if has_inline_candles and mode == 'future':
+                values = [float(row[key]) for key in ('open', 'high', 'low', 'close', 'volume')]
+                if not all(math.isfinite(value) for value in values) or min(values[:4]) <= 0:
+                    return jsonify({'error': 'Kronos model returned invalid OHLCV values'}), 502
+                open_price, high_price, low_price, close_price, volume = values
+                high_price = max(open_price, high_price, close_price)
+                low_price = min(open_price, low_price, close_price)
+                volume = max(0.0, volume)
+            else:
+                open_price, high_price, low_price, close_price = (float(row[key]) for key in ('open', 'high', 'low', 'close'))
+                volume = float(row['volume']) if 'volume' in row else 0
             prediction_results.append({
                 'timestamp': future_timestamps[i].isoformat() if i < len(future_timestamps) else f"T{i}",
-                'open': float(row['open']),
-                'high': float(row['high']),
-                'low': float(row['low']),
-                'close': float(row['close']),
-                'volume': float(row['volume']) if 'volume' in row else 0,
+                'open': open_price,
+                'high': high_price,
+                'low': low_price,
+                'close': close_price,
+                'volume': volume,
                 'amount': float(row['amount']) if 'amount' in row else 0
+            })
+
+        if has_inline_candles and mode == 'future':
+            last_close = float(x_df['close'].iloc[-1])
+            last_predicted_close = prediction_results[-1]['close']
+            predicted_return_percent = 100 * (last_predicted_close / last_close - 1)
+            direction = 'UP' if predicted_return_percent > 0 else 'DOWN' if predicted_return_percent < 0 else 'FLAT'
+            return jsonify({
+                'success': True,
+                'symbol': data.get('symbol'),
+                'timeframe': data['timeframe'],
+                'model': AVAILABLE_MODELS[current_model_key]['name'] if current_model_key in AVAILABLE_MODELS else 'unknown',
+                'lookback': lookback,
+                'pred_len': pred_len,
+                'last_historical_timestamp': x_timestamp.iloc[-1].isoformat(),
+                'prediction': {
+                    'candles': [{key: row[key] for key in ('timestamp', 'open', 'high', 'low', 'close', 'volume')} for row in prediction_results],
+                    'predicted_return_percent': predicted_return_percent,
+                    'direction': direction,
+                },
+                'inference_ms': inference_ms,
             })
         
         # Save prediction results to file
         try:
             save_prediction_results(
-                file_path=file_path,
+                file_path=file_path or '<inline candles>',
                 prediction_type=prediction_type,
                 prediction_results=prediction_results,
                 actual_data=actual_data,
@@ -604,6 +749,7 @@ def predict():
                     'temperature': temperature,
                     'top_p': top_p,
                     'sample_count': sample_count,
+                    'mode': mode,
                     'start_date': start_date if start_date else 'latest'
                 }
             )
@@ -626,7 +772,7 @@ def predict():
 @app.route('/api/load-model', methods=['POST'])
 def load_model():
     """Load Kronos model"""
-    global tokenizer, model, predictor
+    global tokenizer, model, predictor, current_model_key
     
     try:
         if not MODEL_AVAILABLE:
@@ -647,6 +793,7 @@ def load_model():
         
         # Create predictor
         predictor = KronosPredictor(model, tokenizer, device=device, max_context=model_config['context_length'])
+        current_model_key = model_key
         
         return jsonify({
             'success': True,
@@ -705,4 +852,4 @@ if __name__ == '__main__':
     else:
         print("Tip: Will use simulated data for demonstration")
     
-    app.run(debug=True, host='0.0.0.0', port=7070)
+    app.run(debug=False, host='127.0.0.1', port=7070)

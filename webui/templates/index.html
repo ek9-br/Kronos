@@ -508,7 +508,16 @@
                 <hr style="margin: 20px 0; border: 1px solid #e2e8f0;">
 
                 <!-- Time Window Selector -->
-                <div class="time-window-container">
+                <div class="form-group">
+                    <label for="mode-select">Prediction Mode:</label>
+                    <select id="mode-select">
+                        <option value="historical">Historical comparison</option>
+                        <option value="future">After last candle</option>
+                    </select>
+                    <small class="form-text">After last candle uses the latest 400 candles and forecasts the next 120 intervals.</small>
+                </div>
+
+                <div class="time-window-container" id="time-window-container">
                     <h3>⏰ Time Window Selection</h3>
                     <div class="time-window-info">
                         <span id="window-start">Start: --</span>
@@ -651,6 +660,7 @@
             
             // Load available models
             await loadAvailableModels();
+            await updateModelStatus();
             
             // Load data file list
             await loadDataFiles();
@@ -739,8 +749,10 @@
                 const status = response.data;
                 
                 if (status.loaded) {
+                    modelLoaded = true;
                     showStatus('success', `Model loaded: ${status.current_model.name} on ${status.current_model.device}`);
                 } else if (status.available) {
+                    modelLoaded = false;
                     showStatus('info', 'Model available but not loaded');
                 } else {
                     showStatus('warning', 'Model library not available');
@@ -824,8 +836,10 @@
             document.getElementById('data-timeframe').textContent = dataInfo.timeframe;
             document.getElementById('data-prediction-cols').textContent = dataInfo.prediction_columns.join(', ');
             
-            // Initialize time window slider
+            const modeSelect = document.getElementById('mode-select');
+            modeSelect.value = dataInfo.rows >= 520 ? 'historical' : 'future';
             initializeTimeWindowSlider(dataInfo);
+            modeSelect.dispatchEvent(new Event('change'));
         }
 
                     // Time window slider related variables
@@ -1000,7 +1014,7 @@
             }
             
             // Calculate slider position (default select first half of data)
-            const startPercentage = 0.1; // Start from 10%
+            const startPercentage = Math.min(0.1, 1 - windowSize / totalRows);
             const endPercentage = startPercentage + (windowSize / totalRows);
             
             // Update handle positions
@@ -1025,7 +1039,9 @@
             document.getElementById('max-label').textContent = dataInfo.end_date.split('T')[0];
             
             // Initialize slider position
-            updateSliderFromInputs();
+            if (document.getElementById('mode-select').value === 'historical') {
+                updateSliderFromInputs();
+            }
         }
 
         // Start prediction
@@ -1046,20 +1062,7 @@
                 
                 const lookback = parseInt(document.getElementById('lookback').value);
                 const predLen = parseInt(document.getElementById('pred-len').value);
-                
-                // Get selected time range from time window slider
-                const startHandle = document.getElementById('start-handle');
-                const startPercentage = parseFloat(startHandle.style.left) / 100;
-                
-                if (!sliderData) {
-                    showStatus('error', 'Time window slider not initialized');
-                    return;
-                }
-                
-                // Calculate selected time range
-                const totalTime = sliderData.endDate.getTime() - sliderData.startDate.getTime();
-                const startTime = sliderData.startDate.getTime() + (totalTime * startPercentage);
-                const startDate = new Date(startTime);
+                const mode = document.getElementById('mode-select').value;
                 
                 // Get prediction quality parameters
                 const temperature = parseFloat(document.getElementById('temperature').value);
@@ -1068,13 +1071,24 @@
                 
                 let predictionParams = {
                     file_path: currentDataFile,
+                    mode: mode,
                     lookback: lookback,
                     pred_len: predLen,
-                    start_date: startDate.toISOString().slice(0, 16), // Format as YYYY-MM-DDTHH:MM
                     temperature: temperature,
                     top_p: topP,
                     sample_count: sampleCount
                 };
+
+                if (mode === 'historical') {
+                    if (!sliderData || currentDataInfo.rows < lookback + predLen) {
+                        showStatus('error', `Historical comparison needs at least ${lookback + predLen} candles`);
+                        return;
+                    }
+                    const startPercentage = parseFloat(document.getElementById('start-handle').style.left) / 100;
+                    const totalTime = sliderData.endDate.getTime() - sliderData.startDate.getTime();
+                    const startTime = sliderData.startDate.getTime() + (totalTime * startPercentage);
+                    predictionParams.start_date = new Date(startTime).toISOString().slice(0, 16);
+                }
                 
                 console.log('🚀 Starting prediction, parameters:', predictionParams);
                 
@@ -1196,6 +1210,12 @@
             
             // Prediction button
             document.getElementById('predict-btn').addEventListener('click', startPrediction);
+
+            document.getElementById('mode-select').addEventListener('change', function() {
+                const historical = this.value === 'historical';
+                document.getElementById('time-window-container').style.display = historical ? 'block' : 'none';
+                if (historical) updateSliderFromInputs();
+            });
             
             // Prediction quality parameter sliders
             document.getElementById('temperature').addEventListener('input', function() {

@@ -1,0 +1,18 @@
+[Unit]
+Description=Kronos native JSON prediction API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/kronos
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/kronos/.venv/bin/gunicorn --workers 1 --threads 1 --bind 127.0.0.1:7070 --timeout 120 webui.wsgi:app
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
